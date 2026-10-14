@@ -1,0 +1,20 @@
+{
+  "experiments": {
+    "deployment": "local",
+    "update_code": false,
+    "update_storage": false,
+    "download_results": false,
+    "architecture": "x64",
+    "system_variant": "package",
+    "runtime": {
+      "language": "python",
+      "version": "3.11"
+    }
+  },
+  "deployment": {
+    "name": "local",
+    "local": {
+      "storage": {}
+    }
+  }
+}

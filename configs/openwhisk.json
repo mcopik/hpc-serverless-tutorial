@@ -1,0 +1,34 @@
+{
+  "experiments": {
+    "deployment": "openwhisk",
+    "update_code": false,
+    "update_storage": false,
+    "download_results": false,
+    "architecture": "x64",
+    "system_variant": "container",
+    "runtime": {
+      "language": "python",
+      "version": "3.11"
+    }
+  },
+  "deployment": {
+    "name": "openwhisk",
+    "openwhisk": {
+      "shutdownStorage": false,
+      "removeCluster": false,
+      "wskBypassSecurity": "true",
+      "wskExec": "wsk",
+      "experimentalManifest": false,
+      "removeStaleContainers": true,
+      "kubectlExec": "kubectl",
+      "kubernetesNamespace": "openwhisk",
+      "dockerhubRepository": null,
+      "docker_registry": {
+        "registry": "localhost:5001",
+        "username": "",
+        "password": ""
+      },
+      "storage": {}
+    }
+  }
+}

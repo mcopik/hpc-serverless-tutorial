@@ -1,0 +1,27 @@
+# Helm values for openwhisk-deploy-kube on kind (based on deploy/kind/mycluster.yaml).
+# setup.sh sets the API port (whisk.ingress.apiHostPort, nginx.httpsNodePort).
+whisk:
+  ingress:
+    type: NodePort
+    apiHostName: localhost
+    useInternally: false
+  limits:
+    # The defaults (60 per minute, 30 concurrent) throttle benchmarks.
+    actionsInvokesPerminute: 10000
+    actionsInvokesConcurrent: 1000
+    triggersFiresPerminute: 10000
+    actions:
+      memory:
+        # The default maximum (512 MB) is too small for some benchmarks.
+        max: "3072m"
+
+# kind has no dedicated invoker nodes.
+affinity:
+  enabled: false
+toleration:
+  enabled: false
+invoker:
+  options: "-Dwhisk.kubernetes.user-pod-node-affinity.enabled=false"
+  # kind runs containerd, not Docker: action containers must be Kubernetes pods.
+  containerFactory:
+    impl: "kubernetes"

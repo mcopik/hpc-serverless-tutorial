@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Tutorial
+.state/
+cache/
+outputs/
+results/*
+!results/.gitkeep
+configs/*credentials*.json
+serverless-benchmarks
+openwhisk/deps/

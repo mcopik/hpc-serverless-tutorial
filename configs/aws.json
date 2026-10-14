@@ -1,0 +1,25 @@
+{
+  "experiments": {
+    "deployment": "aws",
+    "update_code": false,
+    "update_storage": false,
+    "download_results": false,
+    "architecture": "x64",
+    "system_variant": "package",
+    "runtime": {
+      "language": "python",
+      "version": "3.11"
+    }
+  },
+  "deployment": {
+    "name": "aws",
+    "aws": {
+      "region": "eu-central-1",
+      "lambda-role": "",
+      "resources": {
+        "use-function-url": true,
+        "function-url-auth-type": "NONE"
+      }
+    }
+  }
+}
