@@ -90,11 +90,11 @@ Clone the tutorial wherever you like, and SeBS inside it: everything the course 
 
 ```bash
 git clone https://github.com/mcopik/hpc-serverless-tutorial.git
-cd sebs-tutorial
+cd hpc-serverless-tutorial
 git clone --recursive https://github.com/spcl/serverless-benchmarks.git
 ```
 
-**All commands below run in the `sebs-tutorial` directory.**
+**All commands below run in the `hpc-serverless-tutorial` directory.**
 
 ### 2. Install SeBS
 
