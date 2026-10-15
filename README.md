@@ -240,7 +240,66 @@ It ends with `ALL OK (Thursday)`, or `FAILED at step N: <reason>`, show that lin
 - **Friday:** keep the `results/` folder from Thursday; Friday compares against it. Open `friday.ipynb`. OpenWhisk isn't needed on Friday, so you can stop it to free memory.
 - **Cloud credentials** stay in `configs/` (step 6); the notebooks load them in the cloud sections. Credentials we provide go into the same files.
 
+## Cleaning up
+
+Delete the cluster with OpenWhisk deployment:
+
+```
+./openwhisk/delete.sh
+```
+
+Then, you can also delete the remaining Docker containers of RustFS storage (see `docker ps` for them and then `docker rm`),
+RustFS storage volume: `docker volume rm sebs-tutorial-rustfs`,
+and the images that were produced (see `docker images` for the list of them, and then `docker rmi`). Images include:
+* SeBS images (`spcleth/serverless-benchmarks:*`)
+* KinD images: `kindest/node`
+* Docker registry: `registry:2`
+* Object storage image: `rustfs/rustfs`
+
+If you did the last experiment using the cloud, then delete afterwards SeBS resources. Resources such as functions and storage buckets will be tagged with a resource prefix, such as: `sebs_phdXXXX` (actual name and prefix position varies between resources). The tutorial does not deploy containers to the cloud, only functions with code packages.
+
+### AWS
+
+- Functions (AWS Lambda), e.g., `sebs_phdXXX_210_python_3_11_x64`. Removing a function automatically deletes the function URL as well.
+- Storage buckets (AWS S3), e.g., `sebs-benchmarks-phdXXX`.
+
+SeBS will also retain an IAM role `sebs-lambda-role`, and CloudWatch logs will keep logs of our functions and their invocations.
+
+### GCP
+
+- Functions (Google Cloud Functions gen1), e.g., `sebs_phdXXX_210_python_3_11_x64_gen1`, (Cloud Run console -> Services -> "Go to Cloud Run functions gen1").
+- Storage buckets (Google Cloud Storage), e.g., `sebs-benchmarks-phdXXX` and `sebs-deployment-phdXXXX`. Additionally, Google's Cloud deployment process automatically creates buckets such as `gcf-sources-*`; you can delete those as well.
+- Artifact Registry: the cloud automatically creates a repository during function deployment, name: `gcf-artifacts`. There, you will find build Docker images corresponding to deployed functions,
+e.g., `sebs__XXX__210__python__3__11__x64__gen1`.
+
 ## Troubleshooting
+
+### OpenWhisk Fails at CouchDB Initialization
+
+If OpenWhisk fails to deploy, and `kubectl -n openwhisk get pods` shows several failed pods initializing CouchDB, then it is likely related to [a known issue with Ansible](https://github.com/apache/openwhisk-deploy-kube/issues/673), caused by a large limit on the number of open file descriptors, which Ansible cannot handle.
+
+To resolve this, apply a simple fix in `openwhisk/deps/openwhisk-deploy-kube/helm/openwhisk/configMapFiles/initCouchDB/initdb.sh`.
+There, add `ulimit -n 4096` at its beginning, before git clone:
+
+```
+# this is new!
+ulimit -n 4096
+
+# Clone OpenWhisk to get the ansible playbooks needed to initialize CouchDB
+git clone https://github.com/apache/openwhisk /openwhisk
+pushd /openwhisk
+git checkout $OW_GIT_TAG_OPENWHISK
+popd
+```
+
+Then, run:
+
+```
+./openwhisk/delete.sh
+./openwhisk/deploy.sh
+```
+
+### Other Issues
 
 | Symptom | Fix |
 |---|---|
