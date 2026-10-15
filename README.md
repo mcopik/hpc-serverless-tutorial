@@ -89,7 +89,7 @@ All commands run in a terminal: Linux, the WSL2 Ubuntu terminal, or macOS Termin
 Clone the tutorial wherever you like, and SeBS inside it: everything the course needs then lives in this one directory (SeBS, its Python environment, the OpenWhisk tools), and nothing is installed system-wide.
 
 ```bash
-git clone https://github.com/spcl/sebs-tutorial.git
+git clone https://github.com/mcopik/hpc-serverless-tutorial.git
 cd sebs-tutorial
 git clone --recursive https://github.com/spcl/serverless-benchmarks.git
 ```
