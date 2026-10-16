@@ -204,7 +204,7 @@ GCP: copy the JSON key you downloaded for the service account; the project is re
 cp ~/Downloads/<your-project>-<key-id>.json configs/gcp-credentials.json
 ```
 
-Then set the cloud in the first cloud cell of each notebook (Thursday section 4, Friday C2):
+Then set the cloud in the first cloud cell of each notebook (Thursday section 4, Friday section 1):
 ```python
 CLOUD = "aws"   # or "gcp"
 ```
@@ -219,7 +219,7 @@ The setup check (step 7) does the same check for both clouds. Files named `confi
 
 **Public URLs and cleanup:** SeBS makes the functions invocable over public HTTPS URLs without authentication (a Lambda function URL, or GCP's `allUsers`). The last cell of Friday's notebook deletes the functions; delete SeBS's storage buckets in the cloud console when you no longer need them.
 
-### 7. Check your setup (Thursday)
+### 7. Check your setup
 
 In the tutorial directory:
 
@@ -232,7 +232,21 @@ The script checks what you need on Thursday:
 2. **OpenWhisk:** it deploys OpenWhisk as on Thursday (a few minutes), builds a small test function (`010.sleep`), pushes it to the local registry, invokes it, and removes the cluster again. This tests the deployment and the whole build → push → pull path. If your cluster is already running, it uses it and leaves it running;
 3. your cloud credentials (step 6; it doesn't contact the cloud).
 
-It ends with `ALL OK (Thursday)`, or `FAILED at step N: <reason>`, show that line to the instructor. A separate check for Friday (`./check_setup.sh friday`) follows before Friday.
+It ends with `ALL OK (Thursday)`, or `FAILED at step N: <reason>`, show that line to the instructor.
+
+**Before Friday**, check what Friday needs:
+
+```bash
+uv run --project serverless-benchmarks ./check_setup.sh friday
+```
+
+1. Docker, Python, SeBS, and the Jupyter kernel;
+2. the **local backend**: it starts the object storage, deploys `110.dynamic-html` in Python and Node.js, invokes it, and removes it;
+3. builds a small `stress-ng` image (needs internet once);
+4. makes the `050.os-counters` benchmark of the tutorial repository visible to SeBS;
+5. your cloud credentials.
+
+It ends with `ALL OK (Friday)`, or `FAILED at step N: <reason>`.
 
 ## On the day
 
