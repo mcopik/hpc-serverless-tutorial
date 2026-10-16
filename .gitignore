@@ -228,3 +228,6 @@ results/*
 configs/*credentials*.json
 serverless-benchmarks
 openwhisk/deps/
+
+# bpftrace, downloaded in friday_extra.ipynb
+bin/

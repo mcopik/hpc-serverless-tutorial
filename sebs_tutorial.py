@@ -15,6 +15,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +56,22 @@ if str(OPENWHISK_DEPS) not in os.environ["PATH"].split(os.pathsep):
     os.environ["PATH"] = str(OPENWHISK_DEPS) + os.pathsep + os.environ["PATH"]
 
 OK, FAIL, WARN = "✔", "✘", "!"
+
+
+def _show_link(text: str, path: Path) -> None:
+    """A clickable link in Jupyter; the plain path elsewhere."""
+    try:
+        from IPython import get_ipython
+
+        if get_ipython() is not None and get_ipython().__class__.__name__ == "ZMQInteractiveShell":
+            from IPython.display import Markdown, display
+
+            rel = path.relative_to(TUTORIAL_DIR)
+            display(Markdown(f"{text}: [`{rel}`]({rel})"))
+            return
+    except Exception:
+        pass
+    print(f"{text}: {path}")
 
 
 def _line(status: str, what: str, detail: str = "") -> None:
@@ -205,6 +222,9 @@ def start_storage() -> dict:
     containers on the same Docker bridge, and `external_address`, the machine's IP and
     the published port, given to functions outside the bridge (OpenWhisk pods in kind).
     Both are detected again on every call, so rerun it after your IP address changes.
+
+    The configuration is also saved in .state/storage.json, in the format of SeBS's CLI:
+    `sebs storage stop object .state/storage.json` stops the storage without the notebook.
     """
     from sebs import SeBS
     from sebs.sebs_types import Storage
@@ -217,8 +237,7 @@ def start_storage() -> dict:
     state = STATE_DIR / "storage.json"
     container = None
     if state.exists():
-        with open(state) as f:
-            cfg = config_cls.deserialize(json.load(f))
+        cfg = config_cls.deserialize(_storage_state(state))
         try:
             container = _docker().containers.get(cfg.instance_id)
             if container.status != "running":
@@ -254,10 +273,23 @@ def start_storage() -> dict:
             storage.config.external_address = f"{gateway}:{storage.config.mapped_port}"
     storage.check_external_address()
 
-    serialized = storage.serialize()
+    storage_config = {"object": {"type": STORAGE_TYPE, STORAGE_TYPE: storage.serialize()}}
     with open(state, "w") as f:
-        json.dump(serialized, f, indent=2)
-    return {"object": {"type": STORAGE_TYPE, STORAGE_TYPE: serialized}}
+        json.dump(storage_config, f, indent=2)
+    return storage_config
+
+
+def _storage_state(state: Path) -> dict:
+    """The storage instance's settings from .state/storage.json.
+
+    Written in the CLI's format ({"object": {"type": ..., <type>: {...}}}); earlier versions of
+    this module wrote only the inner dictionary.
+    """
+    with open(state) as f:
+        saved = json.load(f)
+    if "object" in saved:
+        return saved["object"][saved["object"]["type"]]
+    return saved
 
 
 def stop_storage() -> None:
@@ -265,8 +297,7 @@ def stop_storage() -> None:
     state = STATE_DIR / "storage.json"
     if not state.exists():
         return
-    with open(state) as f:
-        instance_id = json.load(f)["instance_id"]
+    instance_id = _storage_state(state)["instance_id"]
     try:
         _docker().containers.get(instance_id).remove(force=True)
     except Exception:
@@ -445,7 +476,271 @@ def cleanup_openwhisk(sebs_client, deployment) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Results
+# Friday: CPU pinning and interference
+# ---------------------------------------------------------------------------
+
+STRESS_IMAGE = "sebs-tutorial/stress-ng:latest"
+
+
+def cpu_topology() -> pd.DataFrame:
+    """CPUs as Docker sees them (on macOS/Windows: the CPUs of Docker Desktop's VM).
+
+    core and socket: the physical core and package of each CPU; smt_siblings: the CPUs that
+    share its core; max_mhz: its highest clock; type: P (performance) or E (efficiency) core,
+    on Intel's hybrid CPUs only.
+    """
+    script = (
+        "for c in /sys/devices/system/cpu/cpu[0-9]*; do "
+        "echo $(basename $c) $(cat $c/topology/core_id $c/topology/physical_package_id "
+        "$c/topology/thread_siblings_list 2>/dev/null) "
+        "$(cat $c/cpufreq/cpuinfo_max_freq 2>/dev/null || echo -); done; "
+        "echo P $(cat /sys/devices/cpu_core/cpus 2>/dev/null); echo E $(cat /sys/devices/cpu_atom/cpus 2>/dev/null)"
+    )
+    out = _docker().containers.run(STRESS_IMAGE, entrypoint=["sh", "-c", script], remove=True).decode()
+    rows, types = [], {}
+    for line in out.split("\n"):
+        parts = line.split()
+        if len(parts) == 5:
+            rows.append({"cpu": int(parts[0][3:]), "core": int(parts[1]), "socket": int(parts[2]),
+                         "smt_siblings": parts[3], "max_mhz": int(parts[4]) // 1000 if parts[4].isdigit() else None})
+        elif len(parts) == 2 and parts[0] in ("P", "E"):
+            types.update({cpu: parts[0] for cpu in _cpu_list(parts[1])})
+    df = pd.DataFrame(rows).sort_values("cpu").reset_index(drop=True)
+    if df.max_mhz.isna().all():
+        df = df.drop(columns="max_mhz")
+    if types:
+        df["type"] = df.cpu.map(types)
+    return df
+
+
+def _cpu_list(text: str) -> List[int]:
+    """'0-3,8' -> [0, 1, 2, 3, 8] (the format of Linux's CPU lists and of Docker's cpuset)."""
+    cpus = []
+    for part in text.split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            cpus += range(int(a), int(b) + 1)
+        elif part.strip():
+            cpus.append(int(part))
+    return cpus
+
+
+def pick_cpus(function_cpu: int = 2) -> Dict[str, Optional[str]]:
+    """CPUs for the interference experiment: the function's CPU, its SMT sibling, another core."""
+    topo = cpu_topology()
+    if function_cpu not in set(topo.cpu):
+        function_cpu = int(topo.cpu.iloc[-1])
+    me = topo[topo.cpu == function_cpu].iloc[0]
+    same_core = topo[(topo.core == me.core) & (topo.socket == me.socket) & (topo.cpu != function_cpu)]
+    other = topo[(topo.core != me.core) | (topo.socket != me.socket)]
+    return {
+        "function": str(function_cpu),
+        "smt_sibling": str(int(same_core.cpu.iloc[0])) if len(same_core) else None,
+        "other_core": str(int(other.cpu.iloc[-1])) if len(other) else None,
+    }
+
+
+def check_cpus(cpus: Dict[str, Optional[str]]) -> bool:
+    """✔ when the CPUs chosen for the interference experiment fit the topology."""
+    topo = cpu_topology().set_index("cpu")
+    good = True
+
+    def cpu(key: str) -> Optional[int]:
+        value = cpus.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.isdigit():
+            raise ValueError(f'CPUS["{key}"] must be one CPU number as a string, e.g. "2", not {value!r}')
+        if int(value) not in topo.index:
+            raise ValueError(f'CPUS["{key}"] = "{value}": Docker sees no such CPU')
+        return int(value)
+
+    fn, sib, other = cpu("function"), cpu("smt_sibling"), cpu("other_core")
+    if fn is None or other is None:
+        _line(FAIL, "CPUS", 'choose "function" and "other_core"')
+        return False
+    me = topo.loc[fn]
+    siblings = [c for c in _cpu_list(me.smt_siblings) if c != fn]
+    if sib is None:
+        ok = not siblings
+        _line(OK if ok else FAIL, "smt_sibling", "none: no SMT" if ok else f"CPU {fn} shares its core with {siblings}")
+    else:
+        ok = sib in siblings
+        _line(OK if ok else FAIL, "smt_sibling", f"CPU {sib} {'shares' if ok else 'does not share'} the core of CPU {fn}")
+    good &= ok
+    other_row = topo.loc[other]
+    ok = (other_row.core, other_row.socket) != (me.core, me.socket)
+    _line(OK if ok else FAIL, "other_core", f"CPU {other}: core {other_row.core}" + ("" if ok else f", the same core as CPU {fn}"))
+    good &= ok
+    if fn == 0:
+        _line(WARN, "function", "CPU 0 handles many interrupts and system tasks: another CPU gives quieter measurements")
+    for column, what in (("type", "type"), ("max_mhz", "maximum clock")):
+        if column in topo.columns and topo.loc[fn, column] != topo.loc[other, column]:
+            _line(WARN, "other_core", f"another {what} than the function's CPU ({topo.loc[other, column]} vs {topo.loc[fn, column]})")
+    return good
+
+
+class stressor:
+    """Context manager: a stress-ng container pinned to `cpus`, running while the block runs.
+
+        with st.stressor(cpus="2"):            # one CPU-burning worker on CPU 2
+            ...
+        with st.stressor(cpus="3", kind="stream"):   # memory-bandwidth stressor on CPU 3
+            ...
+    """
+
+    ARGS = {"cpu": ["--cpu", "1", "--cpu-method", "matrixprod"], "stream": ["--stream", "1"]}
+
+    def __init__(self, cpus: str, kind: str = "cpu", warmup_s: float = 1.0):
+        if kind not in self.ARGS:
+            raise ValueError(f"kind must be one of {list(self.ARGS)}")
+        self.cpus, self.kind, self.warmup_s = cpus, kind, warmup_s
+        self.container = None
+
+    def __enter__(self):
+        self.container = _docker().containers.run(
+            STRESS_IMAGE, command=self.ARGS[self.kind], cpuset_cpus=self.cpus,
+            detach=True, remove=True, labels={"sebs-tutorial": "stressor"},
+        )
+        time.sleep(self.warmup_s)
+        print(f"stressor ({self.kind}) running on CPU {self.cpus}")
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.container.kill()
+        except Exception:
+            pass
+        print("stressor stopped")
+        return False
+
+
+def container_cpuset(func) -> Dict[str, str]:
+    """The CPUs a local function's container may use: Docker's setting and the cgroup's view."""
+    container = _docker().containers.get(func.container.id)
+    container.reload()
+    _, cgroup = container.exec_run(["cat", "/sys/fs/cgroup/cpuset.cpus.effective"])
+    return {
+        "docker": container.attrs["HostConfig"].get("CpusetCpus", ""),
+        "cgroup": cgroup.decode().strip(),
+    }
+
+
+def check_pinning(func, expected: str) -> bool:
+    """✔ when the function's container is pinned to `expected` (e.g. "2")."""
+    seen = container_cpuset(func)
+    if seen["docker"] == expected and seen["cgroup"] == expected:
+        print(f"✔ pinned to CPU {expected} (docker: {seen['docker']}, cgroup: {seen['cgroup']})")
+        return True
+    hint = "did you restart the container (enforce_cold_start) after setting SEBS_LOCAL_CPUSET?"
+    if not seen["docker"]:
+        hint = "Docker didn't receive a cpuset: is your change in _start_container, and did you restart the kernel after editing?"
+    print(f"✘ docker: '{seen['docker']}', cgroup: '{seen['cgroup']}' - {hint}")
+    return False
+
+
+def bootstrap_ci(values, stat=None, n: int = 2000, alpha: float = 0.05, seed: int = 0):
+    """Bootstrap confidence interval of a statistic (default: median)."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    values = np.asarray(pd.Series(values).dropna())
+    stat = stat or np.median
+    samples = [stat(rng.choice(values, size=len(values), replace=True)) for _ in range(n)]
+    return float(np.quantile(samples, alpha / 2)), float(np.quantile(samples, 1 - alpha / 2))
+
+
+def slowdown(base: pd.DataFrame, others: Dict[str, pd.DataFrame], column: str = "client_time") -> pd.DataFrame:
+    """Median slowdown against `base`, with a bootstrap 95% CI of the ratio of medians."""
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    b = base[column].dropna().to_numpy()
+    rows = []
+    for name, df in others.items():
+        o = df[column].dropna().to_numpy()
+        ratios = [
+            np.median(rng.choice(o, len(o))) / np.median(rng.choice(b, len(b))) for _ in range(2000)
+        ]
+        rows.append({
+            "condition": name,
+            "median_ms": round(float(np.median(o)), 2),
+            "slowdown": round(float(np.median(o) / np.median(b)), 3),
+            "ci_low": round(float(np.quantile(ratios, 0.025)), 3),
+            "ci_high": round(float(np.quantile(ratios, 0.975)), 3),
+        })
+    return pd.DataFrame(rows).set_index("condition")
+
+
+def compare_ci(frames: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Median and bootstrap 95% CI per component (ms), one column group per data set."""
+    out = {}
+    for name, df in frames.items():
+        cols = [c for c in COMPONENTS if c in df.columns and df[c].notna().any()]
+        out[name] = {
+            c: f"{df[c].median():.1f} [{bootstrap_ci(df[c])[0]:.1f}, {bootstrap_ci(df[c])[1]:.1f}]" for c in cols
+        }
+    return pd.DataFrame(out)
+
+
+def sebs_source(path: str = "sebs/local/local.py") -> Path:
+    """Make SeBS's source editable from JupyterLab: link it into the tutorial directory."""
+    import sebs
+
+    sebs_dir = Path(sebs.__file__).resolve().parent.parent
+    link = TUTORIAL_DIR / "serverless-benchmarks"
+    if not link.exists():
+        link.symlink_to(sebs_dir, target_is_directory=True)
+    target = link / path
+    _show_link("Open in JupyterLab", target)
+    return target
+
+
+BENCHMARKS_DIR = TUTORIAL_DIR / "benchmarks"
+
+
+def register_benchmark(name: str) -> Path:
+    """Make a benchmark of this repository visible to SeBS.
+
+    SeBS looks for benchmarks only in its own benchmarks/ directory, so we link ours
+    there (benchmarks/900.tutorial/<name>). The code stays here, where you edit it.
+    """
+    import sebs
+
+    source = BENCHMARKS_DIR / name
+    if not (source / "config.json").exists():
+        raise FileNotFoundError(f"{source} is not a benchmark (no config.json)")
+    target_dir = Path(sebs.__file__).resolve().parent.parent / "benchmarks" / "900.tutorial"
+    target_dir.mkdir(exist_ok=True)
+    link = target_dir / name
+    if link.is_symlink() and link.resolve() != source.resolve():
+        link.unlink()
+    if not link.exists():
+        link.symlink_to(source, target_is_directory=True)
+    _show_link(f"Benchmark {name} registered in SeBS; its code", source / "python" / "function.py")
+    return link
+
+
+def cleanup_local(sebs_client, deployment) -> List[str]:
+    """Stop and remove the local function containers created by this notebook."""
+    removed = []
+    for name, func in sebs_client.cache_client.get_all_functions(deployment.name()).items():
+        try:
+            _docker().containers.get(func["instance_id"]).remove(force=True)
+        except Exception:
+            pass
+        sebs_client.cache_client.remove_function(
+            deployment.name(), func["benchmark"], func["config"]["runtime"]["language"], name
+        )
+        removed.append(name)
+    for c in _docker().containers.list(filters={"label": "sebs-tutorial=stressor"}):
+        c.remove(force=True)
+    print(f"{OK} removed {len(removed)} functions: {', '.join(removed)}")
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# Friday: what does the system know about one invocation? (050.os-counters)
 # ---------------------------------------------------------------------------
 
 
@@ -455,6 +750,105 @@ def benchmark_output(result) -> dict:
     if "output" in out:  # local backend
         out = out["output"]
     return out
+
+
+def counters(result) -> dict:
+    """Flattened 050.os-counters measurements of one invocation (times in ms)."""
+    out = benchmark_output(result)
+    res, meas = out["result"], out.get("measurement", {})
+    row = {
+        "workload": res["workload"],
+        "size": res["size"],
+        "cold": res["cold"],
+        "wall_ms": meas["wall_time"] / 1000,
+        "thread_cpu_ms": meas["thread_cpu_time"] / 1000,
+    }
+    for tier in ["posix", "papi"]:
+        for name, value in res[tier]["events"].items():
+            row[f"{tier}.{name}"] = value
+    papi = res["papi"]["events"]
+    if papi.get("PAPI_TOT_CYC") and "PAPI_TOT_INS" in papi:
+        row["papi.IPC"] = round(papi["PAPI_TOT_INS"] / papi["PAPI_TOT_CYC"], 3)
+    return row
+
+
+def counters_table(results: Dict[str, object], with_client_time: bool = False) -> pd.DataFrame:
+    """One column per invocation, one row per counter."""
+    cols = {}
+    for name, r in results.items():
+        row = counters(r)
+        if with_client_time:
+            row = {"client_ms": r.times.client / 1000, **row}
+        cols[name] = row
+    return pd.DataFrame(cols)
+
+
+def check_counters(results: Dict[str, object]) -> bool:
+    """Sanity checks of the compute, memory, and sleep workloads (one line each)."""
+    good = True
+    for name, r in results.items():
+        c = counters(r)
+        if "posix.ru_minflt" not in c:
+            _line(FAIL, name, "no POSIX counters: " + benchmark_output(r)["result"]["posix"]["errors"].get("posix", "")
+                  + " - finish TODO 5, then run get_function again to redeploy")
+            good = False
+            continue
+        ratio = c["wall_ms"] / max(c["thread_cpu_ms"], 1e-3)
+        if c["workload"] == "sleep":
+            ok, what = ratio >= 10, f"wall {c['wall_ms']:.1f} ms >= 10 x thread CPU {c['thread_cpu_ms']:.2f} ms"
+        elif c["workload"] == "memory":
+            expected = c["size"] * 1024 * 1024 // 4096
+            faults = c["posix.ru_minflt"]
+            ok, what = abs(faults - expected) <= 0.2 * expected, f"{faults} minor page faults, expected ~{expected}"
+        else:
+            ok, what = 0.8 <= ratio <= 1.2, f"thread CPU {c['thread_cpu_ms']:.1f} ms ~ wall {c['wall_ms']:.1f} ms"
+        _line(OK if ok else FAIL, f"{name} ({c['workload']})", what)
+        good = good and ok
+    return good
+
+
+def counter_tiers(result) -> pd.DataFrame:
+    """Status and errors of each counter tier, plus what the machine allows."""
+    res = benchmark_output(result)["result"]
+    rows = []
+    for tier in ["posix", "papi"]:
+        t = res[tier]
+        rows.append({
+            "tier": tier,
+            "status": t["status"],
+            "counted": len(t["events"]),
+            "errors": "; ".join(f"{k}: {v}" for k, v in t["errors"].items()) or "",
+        })
+    df = pd.DataFrame(rows).set_index("tier")
+    m = res["machine"]
+    print(f"machine: {m['cpu_model']} ({m['arch']}), kernel {m['kernel']}, "
+          f"perf_event_paranoid={m['perf_event_paranoid']}, PMU exposed: {m['pmu_exposed']}")
+    return df
+
+
+def papi_samples(result) -> pd.DataFrame:
+    """PAPI overflow samples of one 050.os-counters invocation: one row per sample.
+
+    time_ms is relative to the first sample; the event columns are *cumulative* counts
+    since the counters started (use .diff() for the counts between samples).
+    """
+    papi = benchmark_output(result)["result"]["papi"]
+    if papi["status"] not in ("ok", "partial") or "overflow" not in papi:
+        reason = "; ".join(f"{k}: {v}" for k, v in papi["errors"].items()) or "no overflow samples"
+        raise RuntimeError(f"PAPI status {papi['status']}: {reason}")
+    overflow = papi["overflow"]
+    df = pd.DataFrame(overflow["samples"], columns=overflow["columns"])
+    time_us = df.pop("time_us")
+    df.insert(0, "time_ms", (time_us - time_us.min()) / 1000)
+    if overflow["dropped"]:
+        _line(FAIL, "samples", f"{overflow['dropped']} dropped: raise max_samples or the threshold")
+    print(f"{len(df)} samples, one every {overflow['threshold']:,} {overflow['event']}")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Results
+# ---------------------------------------------------------------------------
 
 
 def request_id(result) -> str:
@@ -594,6 +988,10 @@ def save(df: pd.DataFrame, path: str) -> None:
     print(f"{OK} saved {len(df)} rows to {path.relative_to(TUTORIAL_DIR)}")
 
 
+def load(path: str) -> pd.DataFrame:
+    return pd.read_csv(TUTORIAL_DIR / path)
+
+
 def gcp_cost(duration_ms: float, memory_mb: int) -> float:
     """Price of one 1st gen invocation: billed time rounded up to 100 ms, memory + CPU."""
     billed_s = -(-duration_ms // 100) / 10
@@ -706,6 +1104,37 @@ def check(day: str = "thursday") -> bool:
                    "no external address detected: are you connected to a network?")
         except Exception as e:
             report(False, "Storage", hint=str(e))
+
+    if day == "friday":
+        try:
+            _docker().images.get(STRESS_IMAGE)
+            report(True, "stress-ng image", STRESS_IMAGE)
+        except Exception:
+            # Not a failure: section 2 builds it; the CPU check below needs it.
+            _line(WARN, "stress-ng image", "not built yet; section 2, step 2 builds it")
+        else:
+            try:
+                cpus = pick_cpus()
+                report(True, "CPUs for pinning", f"function on {cpus['function']}, SMT sibling {cpus['smt_sibling']}, other core {cpus['other_core']}")
+            except Exception as e:
+                report(False, "CPUs for pinning", hint=str(e))
+        try:
+            cfg = start_storage()["object"][STORAGE_TYPE]
+            report(True, "Storage", f"{STORAGE_TYPE}; local functions will use {cfg['address']}")
+        except Exception as e:
+            report(False, "Storage", hint=str(e))
+        clouds = [c for c in CLOUDS if (RESULTS_DIR / f"thursday_{c}.csv").exists()]
+        if clouds:
+            report(True, "Thursday's results", ", ".join(f"results/thursday_{c}.csv" for c in clouds))
+        else:
+            _line(WARN, "Thursday's results", "results/thursday_<cloud>.csv missing; section 1 uses the instructor's data (reference/)")
+        try:
+            import sebs.local.local as local_module
+            source = Path(local_module.__file__).read_text()
+            pinned = "cpuset_cpus" in source.split("def _start_container", 1)[1].split("containers.run(", 1)[0].replace("# cpuset_cpus=cpuset,", "")
+            _line(OK if pinned else WARN, "SeBS local pinning", "implemented" if pinned else "not implemented yet (that's your task!)")
+        except Exception:
+            pass
 
     found = False
     for cloud in CLOUDS:
